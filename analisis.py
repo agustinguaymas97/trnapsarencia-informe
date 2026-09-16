@@ -1,33 +1,26 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import linregress
 import glob
 import os
 
-# --- CONFIGURACIÓN ---
-UMBRAL_ESTABILIDAD = 1.5      # Sensibilidad para detectar saltos (ruido)
-TIEMPO_MINIMO_MESETA = 10.0   # Segundos mínimos que debe durar un escalón para ser válido
-COLUMNA_TIEMPO = 'Time (s)'       # Cambiar si Phyphox lo exportó distinto
-COLUMNA_LUX = 'Illuminance (lx)'  # Cambiar si Phyphox lo exportó distinto
+# --- CONFIGURACIÓN OPTIMIZADA PARA TUS DATOS ---
+UMBRAL_ESTABILIDAD = 3.0      # Más permisivo para no perder los 16 folios
+TIEMPO_MINIMO_MESETA = 12.0   # Pedimos 12s estables dentro de tus 20s
+COLUMNA_TIEMPO = 'Time (s)'
+COLUMNA_LUX = 'Illuminance (lx)'
 
 def procesar_corrida(ruta_archivo, ax_plot):
-    print(f"\n--- Procesando: {ruta_archivo} ---")
-    
-    # CAMBIO ACÁ: Usamos read_excel para los .xlsx
     df = pd.read_excel(ruta_archivo)
     
-    # Manejo de nombres de columnas si cambian un poco
     if COLUMNA_TIEMPO not in df.columns or COLUMNA_LUX not in df.columns:
-        tiempo_col = df.columns[0] # Asume que la primera es tiempo
-        lux_col = df.columns[1]    # Asume que la segunda es lux
+        tiempo_col, lux_col = df.columns[0], df.columns[1]
     else:
         tiempo_col, lux_col = COLUMNA_TIEMPO, COLUMNA_LUX
 
-    tiempo = df[tiempo_col].values
-    lux = df[lux_col].values
+    tiempo, lux = df[tiempo_col].values, df[lux_col].values
 
-    # 1. Detección de escalones (Mesetas)
+    # 1. Detección de escalones
     delta_t = np.diff(tiempo)
     delta_lux = np.diff(lux)
     derivada = np.abs(delta_lux / delta_t)
@@ -38,91 +31,94 @@ def procesar_corrida(ruta_archivo, ax_plot):
     
     mesetas = []
     meseta_actual = []
-    
     for i, estable in enumerate(mascara_estable):
         if estable:
             meseta_actual.append(i)
         else:
-            if len(meseta_actual) > 0:
-                t_inicio, t_fin = tiempo[meseta_actual[0]], tiempo[meseta_actual[-1]]
-                if (t_fin - t_inicio) >= TIEMPO_MINIMO_MESETA:
-                    mesetas.append(meseta_actual)
+            if len(meseta_actual) > 0 and (tiempo[meseta_actual[-1]] - tiempo[meseta_actual[0]]) >= TIEMPO_MINIMO_MESETA:
+                mesetas.append(meseta_actual)
             meseta_actual = []
             
-    # Guardar la última si cortaste justo
     if len(meseta_actual) > 0 and (tiempo[meseta_actual[-1]] - tiempo[meseta_actual[0]]) >= TIEMPO_MINIMO_MESETA:
         mesetas.append(meseta_actual)
 
-    print(f"Se detectaron {len(mesetas)} escalones estables (Se esperaban 18: 1 Fondo + 1 I0 + 16 Folios).")
-
-    # 2. Extracción de promedios
-    promedios = [np.mean(lux[indices]) for indices in mesetas]
-    
-    if len(promedios) < 3:
-        print("Error: No se detectaron suficientes escalones. Revisar los datos.")
+    if len(mesetas) < 3:
         return None
 
-    fondo = promedios[0]
-    intensidades = np.array(promedios[1:]) # El resto (I0 en adelante)
+    # 2. Extraer Medias y Desviaciones de cada meseta
+    medias = np.array([np.mean(lux[idx]) for idx in mesetas])
+    desv = np.array([np.std(lux[idx]) for idx in mesetas])
     
-    # 3. Limpieza y Linealización
-    intensidades_reales = intensidades - fondo
-    intensidades_reales = intensidades_reales[intensidades_reales > 0] # Evitar log(0) o negativos
+    fondo = medias[0]
+    I_n = medias[1:]
+    sigma_I = desv[1:]
     
-    n_capas = np.arange(len(intensidades_reales))
-    y = np.log(intensidades_reales)
+    # 3. Filtrar datos válidos
+    validos = I_n > fondo
+    I_n = I_n[validos] - fondo
+    sigma_I = sigma_I[validos]
+    n_capas = np.arange(len(I_n))
 
-    # 4. Regresión Lineal
-    resultado = linregress(n_capas, y)
-    alpha = -resultado.slope
-    r_cuadrado = resultado.rvalue**2
+    # 4. Logaritmo y propagación de error
+    y = np.log(I_n)
+    sigma_y = sigma_I / I_n # Propagación del error relativo
+    
+    # 5. Ajuste lineal ponderado y estadística
+    pesos = 1.0 / (sigma_y**2)
+    coefs, cov = np.polyfit(n_capas, y, 1, w=pesos, cov=True)
+    pendiente, ordenada = coefs[0], coefs[1]
+    
+    alpha = -pendiente
+    
+    # Cálculo de R^2
+    y_ajuste = pendiente * n_capas + ordenada
+    ss_res = np.sum((y - y_ajuste)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    r2 = 1 - (ss_res / ss_tot)
+    
+    # Cálculo de Chi^2 reducido
+    chi2 = np.sum(((y - y_ajuste) / sigma_y)**2)
+    grados_libertad = len(n_capas) - 2
+    chi2_red = chi2 / grados_libertad if grados_libertad > 0 else 0
 
-    print(f"Alpha medido: {alpha:.4f} | R^2: {r_cuadrado:.4f}")
-
-    # 5. Graficar en el plot general
+    # 6. Graficar
     nombre_run = os.path.basename(ruta_archivo)
-    ax_plot.scatter(n_capas, y, label=f"{nombre_run} (Datos)", s=20)
-    ax_plot.plot(n_capas, resultado.intercept + resultado.slope * n_capas, linestyle='--', alpha=0.7)
+    ax_plot.scatter(n_capas, y, label=f"{nombre_run}", s=20)
+    ax_plot.plot(n_capas, y_ajuste, linestyle='--', alpha=0.7)
 
-    return alpha
+    return {'Corrida': nombre_run, 'Alpha': alpha, 'R^2': r2, 'Chi^2_red': chi2_red, 'Puntos_Usados': len(n_capas)}
 
 def analizar_todo():
-    # CAMBIO ACÁ: Buscamos archivos .xlsx
     archivos = sorted(glob.glob("*.xlsx"))
     
-    if not archivos:
-        print("No se encontraron archivos .xlsx en esta carpeta.")
-        return
-
-    # Preparar el gráfico
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_title("Linealización de la Ley de Beer-Lambert (5 Corridas)", fontsize=14)
+    ax.set_title("Linealización de la Ley de Beer-Lambert", fontsize=14)
     ax.set_xlabel("Número de folios ($n$)", fontsize=12)
     ax.set_ylabel("$\ln(I_{medido} - I_{fondo})$", fontsize=12)
     ax.grid(True, linestyle=':', alpha=0.6)
 
-    alphas = []
+    resultados = []
     for archivo in archivos:
-        alpha = procesar_corrida(archivo, ax)
-        if alpha is not None:
-            alphas.append(alpha)
+        res = procesar_corrida(archivo, ax)
+        if res is not None:
+            resultados.append(res)
 
-    # Estadística final
-    if alphas:
+    if resultados:
+        # Generar tabla ordenada en la terminal
+        df_res = pd.DataFrame(resultados)
+        print("\n" + "="*65)
+        print("=== TABLA DE RESULTADOS POR CORRIDA (ANÁLISIS DE ERRORES) ===")
+        print("="*65)
+        print(df_res.to_string(index=False, float_format="%.4f"))
+        print("="*65)
+
+        alphas = df_res['Alpha'].values
         alpha_medio = np.mean(alphas)
-        alpha_std = np.std(alphas, ddof=1) # Desviación estándar muestral
-        error_estandar = alpha_std / np.sqrt(len(alphas)) # Incertidumbre del promedio
+        error_estandar = np.std(alphas, ddof=1) / np.sqrt(len(alphas))
 
-        print("\n" + "="*40)
-        print("=== RESULTADO FINAL DEL EXPERIMENTO ===")
-        print("="*40)
-        print(f"Coeficiente de Atenuación Promedio (Alpha) : {alpha_medio:.4f}")
-        print(f"Incertidumbre (Error Estándar de la Media) : ± {error_estandar:.4f}")
-        print(f"Dispersión entre corridas (Desv. Estándar) : {alpha_std:.4f}")
-        print("="*40)
-
-        # Agregar el resultado final como caja de texto en el gráfico
-        texto_resultado = f"$\\alpha_{{final}} = {alpha_medio:.4f} \\pm {error_estandar:.4f}$ por capa\n($N={len(alphas)}$ corridas)"
+        print(f"\nRESULTADO FINAL: Alpha_promedio = {alpha_medio:.4f} ± {error_estandar:.4f}")
+        
+        texto_resultado = f"$\\alpha_{{final}} = {alpha_medio:.4f} \\pm {error_estandar:.4f}$\n($N={len(alphas)}$ corridas)"
         ax.text(0.95, 0.95, texto_resultado, transform=ax.transAxes, 
                 fontsize=12, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -130,7 +126,7 @@ def analizar_todo():
     ax.legend()
     plt.tight_layout()
     plt.savefig("grafico_beer_lambert.png", dpi=300)
-    print("\n¡Gráfico guardado como 'grafico_beer_lambert.png'!")
+    print("\n¡Gráfico guardado con éxito! Revisá la imagen y la tabla superior.")
 
 if __name__ == '__main__':
     analizar_todo()
